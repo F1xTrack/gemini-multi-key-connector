@@ -14,6 +14,11 @@ API_KEYS_FILE = 'api_keys.json'
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 3
 TARGET_TIMEZONE = 'America/Los_Angeles'
+SUPPORTED_MODELS = [
+    "gemini-1.5-pro-latest",
+    "gemini-1.5-flash-latest",
+    "gemini-1.0-pro",
+]
 
 # --- Global Variables & Locks ---
 api_keys = []
@@ -96,6 +101,25 @@ def print_status_tui():
 
 
 # --- Flask Endpoint ---
+
+@app.route('/v1/models', methods=['GET'])
+def get_models():
+    """
+    Returns a list of available models in a format compatible with OpenAI clients.
+    """
+    model_list = []
+    for model_name in SUPPORTED_MODELS:
+        model_list.append({
+            "id": f"{model_name}:generateContent",
+            "object": "model",
+            "created": 1686935002,
+            "owned_by": "google"
+        })
+    
+    return jsonify({
+        "object": "list",
+        "data": model_list
+    })
 
 @app.route('/v1beta/models/<string:model_name>:generateContent', methods=['POST'])
 def proxy_to_gemini(model_name):
