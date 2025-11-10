@@ -174,6 +174,6 @@ if __name__ == '__main__':
         reset_thread = threading.Thread(target=reset_key_index_daily, daemon=True)
         reset_thread.start()
         print_status_tui()
-        app.run(port=PORT)
+        app.run(host='0.0.0.0', port=PORT)
     else:
         print("Сервер не может быть запущен из-за ошибки загрузки ключей.")
