@@ -17,7 +17,6 @@ TARGET_TIMEZONE = 'America/Los_Angeles'
 
 # --- Global Variables & Locks ---
 api_keys = []
-current_key_index = 0
 key_lock = threading.Lock()
 file_lock = threading.Lock()
 
@@ -28,9 +27,6 @@ app = Flask(__name__)
 def load_api_keys():
     """
     Loads API keys from the specified JSON file.
-
-    Returns:
-        list: A list of API key dictionaries, or an empty list if loading fails.
     """
     try:
         with open(API_KEYS_FILE, 'r') as f:
@@ -49,9 +45,9 @@ def save_api_keys():
         with open(API_KEYS_FILE, 'w') as f:
             json.dump(api_keys, f, indent=4)
 
-def reset_key_index_daily():
+def reset_rpd_limits_daily():
     """
-    Resets current_key_index to 0 every day at midnight in the target timezone.
+    Resets RPD (Requests Per Day) limits for all models on all keys at midnight.
     This function is intended to be run in a background thread.
     """
     pt_timezone = pytz.timezone(TARGET_TIMEZONE)
@@ -60,13 +56,18 @@ def reset_key_index_daily():
         tomorrow_pt = (now_pt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         sleep_seconds = (tomorrow_pt - now_pt).total_seconds()
         
-        print(f"Сброс индекса ключей произойдет через {sleep_seconds:.2f} секунд.")
+        print(f"Сброс RPD лимитов произойдет через {sleep_seconds:.2f} секунд.")
         time.sleep(sleep_seconds)
         
-        global current_key_index
         with key_lock:
-            current_key_index = 0
-            print("Индекс текущего ключа сброшен на 0.")
+            for key_info in api_keys:
+                if 'usage' in key_info:
+                    for model_name in key_info['usage']:
+                        key_info['usage'][model_name]['rpd_limit_reached'] = False
+                        key_info['usage'][model_name]['request_count'] = 0
+            save_api_keys()
+            print("RPD лимиты и счетчики запросов сброшены для всех ключей и моделей.")
+        
         time.sleep(1) # Avoid resetting multiple times in the same second
 
 def print_status_tui():
@@ -78,23 +79,29 @@ def print_status_tui():
     print(f"Статус: {'Работает' if api_keys else 'Ошибка'}")
     print(f"Порт: {PORT}")
     print(f"Загружено ключей: {len(api_keys)}")
-    print(f"Текущий индекс ключа: {current_key_index}")
     print("-----------------------------")
     if api_keys:
         for i, key_info in enumerate(api_keys):
-            is_current = "<--" if i == current_key_index else ""
-            print(f"  - Ключ {i+1}: Использовано токенов: {key_info.get('token_usage', 0)} {is_current}")
+            print(f"  - Ключ {i+1}:")
+            if 'usage' in key_info:
+                for model, usage in key_info['usage'].items():
+                    limit_status = "ДОСТИГНУТ" if usage.get('rpd_limit_reached', False) else "OK"
+                    print(f"    - Модель: {model}")
+                    print(f"      Токены: {usage.get('token_count', 0)}")
+                    print(f"      Запросы: {usage.get('request_count', 0)}")
+                    print(f"      Лимит RPD: {limit_status}")
+            else:
+                print("    - Данные об использовании отсутствуют.")
     print("-----------------------------")
 
 
 # --- Flask Endpoint ---
 
-@app.route('/v1beta/models/gemini-pro:generateContent', methods=['POST'])
-def proxy_to_gemini():
+@app.route('/v1beta/models/<string:model_name>:generateContent', methods=['POST'])
+def proxy_to_gemini(model_name):
     """
-    Proxies requests to the Google Gemini API, handling key rotation and retries.
+    Proxies requests to the Google Gemini API, handling key rotation, model-specific limits, and retries.
     """
-    global current_key_index
     request_data = request.get_json()
 
     if not api_keys:
@@ -102,47 +109,62 @@ def proxy_to_gemini():
 
     last_error_response = None
 
-    while current_key_index < len(api_keys):
-        api_key = api_keys[current_key_index]['key']
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-pro')
+    for key_index, key_info in enumerate(api_keys):
+        with key_lock:
+            # --- Check RPD Limit before making a request ---
+            usage_data = key_info.setdefault('usage', {})
+            model_usage = usage_data.setdefault(model_name, {
+                'token_count': 0,
+                'request_count': 0,
+                'rpd_limit_reached': False
+            })
+            
+            if model_usage.get('rpd_limit_reached', False):
+                print(f"Ключ #{key_index + 1} уже достиг RPD лимита для модели '{model_name}'. Пропускаем.")
+                continue
+
+        api_key = key_info['key']
+        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
         
         print_status_tui()
-        print(f"\nИспользуется ключ #{current_key_index + 1}")
-
-        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={api_key}"
+        print(f"\nИспользуется ключ #{key_index + 1} для модели '{model_name}'")
 
         for attempt in range(MAX_RETRIES):
             try:
                 response = requests.post(gemini_url, json=request_data)
 
-                # --- 429 Error Handling: Rate limit exceeded ---
-                if response.status_code == 429:
-                    last_error_response = response
-                    print(f"Получен статус 429 (Too Many Requests) для ключа #{current_key_index + 1}. Попытка {attempt + 1}/{MAX_RETRIES}")
-                    # Key rotation is handled by breaking the inner loop and advancing the outer while loop
+                # --- 429 Error Handling: RPD limit exceeded ---
+                if response.status_code == 429 and "quotaMetric" in response.text:
+                    print(f"Получен статус 429 (RPD Limit) для ключа #{key_index + 1} и модели '{model_name}'.")
                     with key_lock:
-                        current_key_index += 1
-                    break # Break from retry loop to switch key
+                        api_keys[key_index]['usage'][model_name]['rpd_limit_reached'] = True
+                        save_api_keys()
+                    last_error_response = response
+                    break # Break from retry loop to switch to the next key
 
-                # --- 503 Error Handling: Service Unavailable ---
+                # --- Other 429/503 Error Handling: Retryable errors ---
                 if response.status_code == 503 and attempt < MAX_RETRIES - 1:
-                    print(f"Получен статус 503 (Service Unavailable). Повторная попытка через {RETRY_DELAY_SECONDS} сек...")
+                    print(f"Получен статус {response.status_code}. Повторная попытка через {RETRY_DELAY_SECONDS} сек...")
                     time.sleep(RETRY_DELAY_SECONDS)
                     continue # Retry with the same key
 
                 response.raise_for_status()
 
-                # --- Success Case ---
+                # --- Success Case (200 OK) ---
                 response_data = response.json()
                 
-                # Update token usage
+                # Configure genai for token counting
+                genai.configure(api_key=api_key)
+                model = genai.GenerativeModel(model_name)
+                
                 request_tokens = model.count_tokens(request_data).total_tokens
                 response_tokens = model.count_tokens(response_data).total_tokens
                 total_tokens = request_tokens + response_tokens
                 
-                api_keys[current_key_index]['token_usage'] += total_tokens
-                save_api_keys()
+                with key_lock:
+                    api_keys[key_index]['usage'][model_name]['token_count'] += total_tokens
+                    api_keys[key_index]['usage'][model_name]['request_count'] += 1
+                    save_api_keys()
                 
                 print(f"Запрос успешен. Использовано токенов: {total_tokens}")
                 print_status_tui()
@@ -154,24 +176,27 @@ def proxy_to_gemini():
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(RETRY_DELAY_SECONDS)
                 else:
-                    return jsonify({"error": str(e)}), 500
-        else: # This 'else' belongs to the for loop, executed if the loop finishes without 'break'
-            continue # Continue to the next key if all retries for the current key failed
-
-        break # Break from the while loop if we switched keys due to a 429 error
-
+                    last_error_response = jsonify({"error": str(e)}), 500
+        
+        # If the retry loop finishes without success, we've already broken out to the next key for RPD limit
+        # or we continue the outer loop to the next key
+        
+    # --- All keys have been tried ---
     if last_error_response:
+        print("Все API ключи были опробованы, возвращается последняя ошибка.")
+        if isinstance(last_error_response, tuple): # Our custom error
+             return last_error_response
         return last_error_response.content, last_error_response.status_code, last_error_response.headers.items()
     
-    print("Все API ключи исчерпали свою квоту.")
-    return jsonify({"error": "All API keys have reached their quota."}), 429
+    print("Все API ключи исчерпали свою квоту или недоступны.")
+    return jsonify({"error": "All available API keys have reached their quota or are unable to process the request."}), 429
 
 # --- Main Execution ---
 
 if __name__ == '__main__':
     api_keys = load_api_keys()
     if api_keys:
-        reset_thread = threading.Thread(target=reset_key_index_daily, daemon=True)
+        reset_thread = threading.Thread(target=reset_rpd_limits_daily, daemon=True)
         reset_thread.start()
         print_status_tui()
         app.run(host='0.0.0.0', port=PORT)
