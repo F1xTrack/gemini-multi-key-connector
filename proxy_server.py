@@ -3,7 +3,7 @@ import time
 import random
 import string
 import threading
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import requests
 import google.generativeai as genai
 from datetime import datetime, timedelta
@@ -191,7 +191,12 @@ def handle_rate_limit_error(error_response, key_index, model_name):
     if "quotaMetric" in error_response.text:
         app.logger.warning(f"Получен статус 429 (RPD Limit) для ключа #{key_index + 1} и модели '{model_name}'.")
         with key_lock:
-            api_keys[key_index]['usage'][model_name]['rpd_limit_reached'] = True
+            # Убедимся, что 'usage' и 'model_name' существуют перед записью
+            usage_data = api_keys[key_index].setdefault('usage', {})
+            model_usage = usage_data.setdefault(model_name, {
+                'token_count': 0, 'request_count': 0, 'rpd_limit_reached': False
+            })
+            model_usage['rpd_limit_reached'] = True
             save_api_keys()
     
     return None
@@ -309,7 +314,13 @@ def proxy_to_gemini(model_name):
                 app.logger.info(f"Ключ #{key_index + 1} уже достиг RPD лимита для модели '{model_name}'. Пропускаем.")
                 continue
 
-        api_key = key_info['key']
+        api_key_data = key_info['key']
+        if isinstance(api_key_data, dict):
+            # Обработка старого формата, где ключ находится внутри вложенной структуры
+            api_key = api_key_data.get('key', [None, None])[1]
+        else:
+            # Обработка нового формата, где ключ является простой строкой
+            api_key = api_key_data
         gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
         
         print_status_tui()
@@ -317,7 +328,8 @@ def proxy_to_gemini(model_name):
 
         for attempt in range(MAX_RETRIES):
             try:
-                response = requests.post(gemini_url, params={'key': api_key}, json=request_data)
+                headers = {'x-goog-api-key': api_key}
+                response = requests.post(gemini_url, headers=headers, json=request_data)
 
                 if response.status_code == 503 and attempt < MAX_RETRIES - 1:
                     app.logger.warning(f"Получен статус 503. Повторная попытка через {RETRY_DELAY_SECONDS} сек...")
@@ -328,22 +340,16 @@ def proxy_to_gemini(model_name):
 
                 response_data = response.json()
                 
-                genai.configure(api_key=api_key)
-                model = genai.GenerativeModel(model_name)
-                
-                request_tokens = model.count_tokens(request_data).total_tokens
-                response_tokens = model.count_tokens(response_data).total_tokens
-                total_tokens = request_tokens + response_tokens
-                
                 with key_lock:
-                    api_keys[key_index]['usage'][model_name]['token_count'] += total_tokens
                     api_keys[key_index]['usage'][model_name]['request_count'] += 1
                     save_api_keys()
                 
-                app.logger.info(f"Запрос успешен. Использовано токенов: {total_tokens}")
+                app.logger.info(f"Запрос успешен.")
                 print_status_tui()
 
-                return response.content, response.status_code, response.headers.items()
+                # Создаем и возвращаем правильный объект Response
+                headers_dict = {k: v for k, v in response.headers.items() if k.lower() not in ['transfer-encoding', 'content-encoding']}
+                return Response(response.content, status=response.status_code, headers=headers_dict)
 
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 429:
@@ -372,7 +378,9 @@ def proxy_to_gemini(model_name):
         app.logger.error("Все API ключи были опробованы, возвращается последняя ошибка.")
         if isinstance(last_error_response, tuple):
              return last_error_response
-        return last_error_response.content, last_error_response.status_code, last_error_response.headers.items()
+        # Также оборачиваем ответ с ошибкой в Response
+        headers_dict = {k: v for k, v in last_error_response.headers.items() if k.lower() not in ['transfer-encoding', 'content-encoding']}
+        return Response(last_error_response.content, status=last_error_response.status_code, headers=headers_dict)
     
     app.logger.warning("Все API ключи исчерпали свою квоту или недоступны.")
     return jsonify({"error": "All available API keys have reached their quota or are unable to process the request."}), 429
