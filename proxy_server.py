@@ -353,6 +353,11 @@ def proxy_to_gemini(model_name):
                 return Response(response.content, status=response.status_code, headers=headers_dict)
 
             except requests.exceptions.HTTPError as e:
+                if e.response and e.response.status_code == 500:
+                    app.logger.warning(f"Caught 500 Internal Server Error. Retrying in 2 seconds... (Attempt {attempt + 1}/{MAX_RETRIES})")
+                    time.sleep(2)
+                    continue
+
                 if e.response.status_code == 429:
                     delay = handle_rate_limit_error(e.response, key_index, model_name)
                     if delay is not None:
@@ -362,7 +367,8 @@ def proxy_to_gemini(model_name):
                         last_error_response = e.response
                         break # RPD limit reached, break to try next key
                 
-                app.logger.error(f"Ошибка запроса: {e}. Попытка {attempt + 1}/{MAX_RETRIES}")
+                app.logger.error(f"Unhandled HTTP Error for key {key_index}: {e}")
+                break # Прерываем retries для текущего ключа
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(RETRY_DELAY_SECONDS)
                 else:
