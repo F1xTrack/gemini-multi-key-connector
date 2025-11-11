@@ -109,29 +109,30 @@ def convert_openai_to_gemini_request(openai_request):
     """
     messages = openai_request.get('messages', [])
     gemini_contents = []
-    system_prompt = None
-
+    system_prompt = ""
+    
+    # Сначала найдем системный промпт
+    for message in messages:
+        if message.get('role') == 'system':
+            system_prompt = message.get('content', '') + "\n\n"
+            
+    # Теперь обработаем остальные сообщения
     for message in messages:
         role = message.get('role')
-        content = message.get('content')
-
         if role == 'system':
-            system_prompt = content
-            continue
+            continue # Уже обработали
+        
+        # Преобразуем роли
+        gemini_role = "model" if role == "assistant" else "user"
+        
+        gemini_contents.append({
+            "role": gemini_role,
+            "parts": [{"text": message.get('content', '')}]
+        })
 
-        gemini_role = 'user' if role == 'user' else 'model'
-
-        if system_prompt and gemini_role == 'user':
-            if isinstance(content, str):
-                content = f"{system_prompt}\n{content}"
-            elif isinstance(content, list):
-                if content and isinstance(content[0], dict) and content[0].get('type') == 'text':
-                    content[0]['text'] = f"{system_prompt}\n{content[0]['text']}"
-                else:
-                    content.insert(0, {'type': 'text', 'text': system_prompt})
-            system_prompt = None
-
-        gemini_contents.append({'role': gemini_role, 'parts': [{'text': content}]})
+    # Добавляем системный промпт к первому сообщению пользователя, если он есть
+    if system_prompt and gemini_contents and gemini_contents[0]['role'] == 'user':
+        gemini_contents[0]['parts'][0]['text'] = system_prompt + gemini_contents[0]['parts'][0]['text']
 
     return {'contents': gemini_contents}
 
