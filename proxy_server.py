@@ -1,5 +1,7 @@
 import json
 import time
+import random
+import string
 import threading
 from flask import Flask, request, jsonify
 import requests
@@ -102,24 +104,108 @@ def print_status_tui():
 
 # --- Flask Endpoint ---
 
-@app.route('/models', methods=['GET'])
-def get_models():
-    """
-    Returns a list of available models in a format compatible with OpenAI clients.
-    """
-    model_list = []
-    for model_name in SUPPORTED_MODELS:
-        model_list.append({
-            "id": f"{model_name}:generateContent",
+@app.route('/v1/models', methods=['GET'])
+def list_models():
+    model_data = []
+    for model_id in SUPPORTED_MODELS:
+        model_data.append({
+            "id": model_id,
             "object": "model",
-            "created": 1686935002,
+            "created": int(time.time()),
             "owned_by": "google"
         })
-    
     return jsonify({
         "object": "list",
-        "data": model_list
+        "data": model_data
     })
+
+@app.route('/v1/chat/completions', methods=['POST'])
+def chat_completions():
+    openai_request = request.json
+    model_name = openai_request.get('model')
+    messages = openai_request.get('messages', [])
+
+    gemini_contents = []
+    system_prompt = None
+
+    for message in messages:
+        role = message.get('role')
+        content = message.get('content')
+
+        if role == 'system':
+            system_prompt = content
+            continue
+
+        # Gemini uses 'user' and 'model' roles
+        gemini_role = 'user' if role == 'user' else 'model'
+
+        # If there was a system prompt, prepend it to the first user message
+        if system_prompt and gemini_role == 'user':
+            if isinstance(content, str):
+                content = system_prompt + "\n" + content
+            elif isinstance(content, list):
+                 # Handle list content (e.g., multimodal)
+                if content and isinstance(content[0], dict) and content[0].get('type') == 'text':
+                    content[0]['text'] = system_prompt + "\n" + content[0]['text']
+                else: # Prepend as a new text part
+                    content.insert(0, {'type': 'text', 'text': system_prompt})
+            system_prompt = None # Ensure it's only used once
+
+        gemini_contents.append({'role': gemini_role, 'parts': [{'text': content}]})
+
+
+    gemini_request_data = {'contents': gemini_contents}
+    # Forward the request to the internal proxy endpoint
+    internal_proxy_url = f"http://127.0.0.1:{PORT}/v1beta/models/{model_name}:generateContent"
+
+    try:
+        response = requests.post(internal_proxy_url, json=gemini_request_data, timeout=300)
+        response.raise_for_status()
+        gemini_response_json = response.json()
+
+        # Convert Gemini response to OpenAI format
+        completion_id = 'chatcmpl-' + ''.join(random.choices(string.ascii_letters + string.digits, k=29))
+        created_time = int(time.time())
+
+        choices = []
+        if gemini_response_json.get('candidates'):
+            for candidate in gemini_response_json['candidates']:
+                content = candidate.get('content', {}).get('parts', [{}])[0].get('text', '')
+                choices.append({
+                    "index": candidate.get('index', 0),
+                    "message": {
+                        "role": "assistant",
+                        "content": content
+                    },
+                    "finish_reason": candidate.get('finishReason', 'stop')
+                })
+
+        # Placeholder for usage, as Gemini API doesn't provide it in the same way
+        usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }
+
+        openai_response = {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created_time,
+            "model": model_name,
+            "choices": choices,
+            "usage": usage
+        }
+
+        return jsonify(openai_response)
+
+    except requests.exceptions.RequestException as e:
+        error_message = f"Failed to connect to the internal Gemini proxy: {str(e)}"
+        status_code = 500
+        if e.response is not None:
+            error_message = e.response.text
+            status_code = e.response.status_code
+        return jsonify({"error": error_message}), status_code
+
 
 @app.route('/v1beta/models/<string:model_name>:generateContent', methods=['POST'])
 def proxy_to_gemini(model_name):
