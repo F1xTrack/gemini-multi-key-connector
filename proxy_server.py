@@ -102,7 +102,7 @@ def print_status_tui():
 
 # --- Flask Endpoint ---
 
-@app.route('/v1/models', methods=['GET'])
+@app.route('/models', methods=['GET'])
 def get_models():
     """
     Returns a list of available models in a format compatible with OpenAI clients.
