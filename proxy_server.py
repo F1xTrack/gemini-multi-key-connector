@@ -29,7 +29,7 @@ file_lock = threading.Lock()
 
 app = Flask(__name__)
 
-# --- Helper Functions ---
+# --- Helper Functions: File & Key Management ---
 
 def load_api_keys():
     """
@@ -39,9 +39,9 @@ def load_api_keys():
         with open(API_KEYS_FILE, 'r') as f:
             return json.load(f)
     except FileNotFoundError:
-        print(f"Ошибка: файл '{API_KEYS_FILE}' не найден.")
+        app.logger.error(f"Ошибка: файл '{API_KEYS_FILE}' не найден.")
     except (ValueError, KeyError, IndexError) as e:
-        print(f"Ошибка при чтении или обработке '{API_KEYS_FILE}': {e}")
+        app.logger.error(f"Ошибка при чтении или обработке '{API_KEYS_FILE}': {e}")
     return []
 
 def save_api_keys():
@@ -63,7 +63,7 @@ def reset_rpd_limits_daily():
         tomorrow_pt = (now_pt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         sleep_seconds = (tomorrow_pt - now_pt).total_seconds()
         
-        print(f"Сброс RPD лимитов произойдет через {sleep_seconds:.2f} секунд.")
+        app.logger.info(f"Сброс RPD лимитов произойдет через {sleep_seconds:.2f} секунд.")
         time.sleep(sleep_seconds)
         
         with key_lock:
@@ -73,7 +73,7 @@ def reset_rpd_limits_daily():
                         key_info['usage'][model_name]['rpd_limit_reached'] = False
                         key_info['usage'][model_name]['request_count'] = 0
             save_api_keys()
-            print("RPD лимиты и счетчики запросов сброшены для всех ключей и моделей.")
+            app.logger.info("RPD лимиты и счетчики запросов сброшены для всех ключей и моделей.")
         
         time.sleep(1) # Avoid resetting multiple times in the same second
 
@@ -101,8 +101,102 @@ def print_status_tui():
                 print("    - Данные об использовании отсутствуют.")
     print("-----------------------------")
 
+# --- Helper Functions: Request/Response Conversion ---
 
-# --- Flask Endpoint ---
+def convert_openai_to_gemini_request(openai_request):
+    """
+    Converts an OpenAI-formatted chat completion request to a Gemini-formatted one.
+    """
+    messages = openai_request.get('messages', [])
+    gemini_contents = []
+    system_prompt = None
+
+    for message in messages:
+        role = message.get('role')
+        content = message.get('content')
+
+        if role == 'system':
+            system_prompt = content
+            continue
+
+        gemini_role = 'user' if role == 'user' else 'model'
+
+        if system_prompt and gemini_role == 'user':
+            if isinstance(content, str):
+                content = f"{system_prompt}\n{content}"
+            elif isinstance(content, list):
+                if content and isinstance(content[0], dict) and content[0].get('type') == 'text':
+                    content[0]['text'] = f"{system_prompt}\n{content[0]['text']}"
+                else:
+                    content.insert(0, {'type': 'text', 'text': system_prompt})
+            system_prompt = None
+
+        gemini_contents.append({'role': gemini_role, 'parts': [{'text': content}]})
+
+    return {'contents': gemini_contents}
+
+def convert_gemini_to_openai_response(gemini_response_json, model_name):
+    """
+    Converts a Gemini response to the OpenAI chat completion format.
+    """
+    completion_id = 'chatcmpl-' + ''.join(random.choices(string.ascii_letters + string.digits, k=29))
+    created_time = int(time.time())
+    choices = []
+
+    if gemini_response_json.get('candidates'):
+        for candidate in gemini_response_json['candidates']:
+            content = candidate.get('content', {}).get('parts', [{}])[0].get('text', '')
+            choices.append({
+                "index": candidate.get('index', 0),
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": candidate.get('finishReason', 'stop')
+            })
+
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    return {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created_time,
+        "model": model_name,
+        "choices": choices,
+        "usage": usage
+    }
+
+# --- Helper Functions: Error Handling ---
+
+def handle_rate_limit_error(error_response, key_index, model_name):
+    """
+    Parses a 429 error for retry-after info or identifies it as a daily limit error.
+    Returns delay in seconds if retryable, or None if it's a hard limit.
+    """
+    try:
+        error_json = error_response.json()
+        error_message_str = error_json.get("error", {}).get("message", "")
+        
+        inner_error_json = json.loads(error_message_str)
+        details = inner_error_json.get("error", {}).get("details", [])
+        
+        retry_info = next((d for d in details if d.get("@type") == "type.googleapis.com/google.rpc.RetryInfo"), None)
+
+        if retry_info and 'retryDelay' in retry_info:
+            delay_str = retry_info['retryDelay'].replace('s', '')
+            delay_seconds = float(delay_str)
+            app.logger.warning(f"Получен статус 429 с retryDelay. Ожидание {delay_seconds} сек...")
+            return delay_seconds
+            
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as json_e:
+        app.logger.error(f"Не удалось распарсить retryDelay из ответа 429: {json_e}")
+
+    if "quotaMetric" in error_response.text:
+        app.logger.warning(f"Получен статус 429 (RPD Limit) для ключа #{key_index + 1} и модели '{model_name}'.")
+        with key_lock:
+            api_keys[key_index]['usage'][model_name]['rpd_limit_reached'] = True
+            save_api_keys()
+    
+    return None
+
+# --- Flask Endpoints ---
 
 @app.route('/', methods=['GET'])
 def status_page():
@@ -149,56 +243,29 @@ def status_page():
 
 @app.route('/v1/models', methods=['GET'])
 def list_models():
-    model_data = []
-    for model_id in SUPPORTED_MODELS:
-        model_data.append({
+    """
+    Provides a list of supported models in the OpenAI format.
+    """
+    model_data = [
+        {
             "id": model_id,
             "object": "model",
             "created": int(time.time()),
             "owned_by": "google"
-        })
-    return jsonify({
-        "object": "list",
-        "data": model_data
-    })
+        } for model_id in SUPPORTED_MODELS
+    ]
+    return jsonify({"object": "list", "data": model_data})
 
 @app.route('/v1/chat/completions', methods=['POST'])
 def chat_completions():
+    """
+    Handles OpenAI-compatible chat completion requests.
+    """
     openai_request = request.json
     model_name = openai_request.get('model')
-    messages = openai_request.get('messages', [])
 
-    gemini_contents = []
-    system_prompt = None
-
-    for message in messages:
-        role = message.get('role')
-        content = message.get('content')
-
-        if role == 'system':
-            system_prompt = content
-            continue
-
-        # Gemini uses 'user' and 'model' roles
-        gemini_role = 'user' if role == 'user' else 'model'
-
-        # If there was a system prompt, prepend it to the first user message
-        if system_prompt and gemini_role == 'user':
-            if isinstance(content, str):
-                content = system_prompt + "\n" + content
-            elif isinstance(content, list):
-                 # Handle list content (e.g., multimodal)
-                if content and isinstance(content[0], dict) and content[0].get('type') == 'text':
-                    content[0]['text'] = system_prompt + "\n" + content[0]['text']
-                else: # Prepend as a new text part
-                    content.insert(0, {'type': 'text', 'text': system_prompt})
-            system_prompt = None # Ensure it's only used once
-
-        gemini_contents.append({'role': gemini_role, 'parts': [{'text': content}]})
-
-
-    gemini_request_data = {'contents': gemini_contents}
-    # Forward the request to the internal proxy endpoint
+    gemini_request_data = convert_openai_to_gemini_request(openai_request)
+    
     internal_proxy_url = f"http://127.0.0.1:{PORT}/v1beta/models/{model_name}:generateContent"
 
     try:
@@ -206,39 +273,7 @@ def chat_completions():
         response.raise_for_status()
         gemini_response_json = response.json()
 
-        # Convert Gemini response to OpenAI format
-        completion_id = 'chatcmpl-' + ''.join(random.choices(string.ascii_letters + string.digits, k=29))
-        created_time = int(time.time())
-
-        choices = []
-        if gemini_response_json.get('candidates'):
-            for candidate in gemini_response_json['candidates']:
-                content = candidate.get('content', {}).get('parts', [{}])[0].get('text', '')
-                choices.append({
-                    "index": candidate.get('index', 0),
-                    "message": {
-                        "role": "assistant",
-                        "content": content
-                    },
-                    "finish_reason": candidate.get('finishReason', 'stop')
-                })
-
-        # Placeholder for usage, as Gemini API doesn't provide it in the same way
-        usage = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0
-        }
-
-        openai_response = {
-            "id": completion_id,
-            "object": "chat.completion",
-            "created": created_time,
-            "model": model_name,
-            "choices": choices,
-            "usage": usage
-        }
-
+        openai_response = convert_gemini_to_openai_response(gemini_response_json, model_name)
         return jsonify(openai_response)
 
     except requests.exceptions.RequestException as e:
@@ -247,57 +282,52 @@ def chat_completions():
         if e.response is not None:
             error_message = e.response.text
             status_code = e.response.status_code
+        app.logger.error(f"Error in chat_completions: {error_message}")
         return jsonify({"error": error_message}), status_code
-
 
 @app.route('/v1beta/models/<string:model_name>:generateContent', methods=['POST'])
 def proxy_to_gemini(model_name):
     """
-    Proxies requests to the Google Gemini API, handling key rotation, model-specific limits, and retries.
+    Proxies requests to the Google Gemini API, handling key rotation, limits, and retries.
     """
     request_data = request.get_json()
 
     if not api_keys:
+        app.logger.error("API keys are not loaded or missing.")
         return jsonify({"error": "API ключи не загружены или отсутствуют."}), 500
 
     last_error_response = None
 
     for key_index, key_info in enumerate(api_keys):
         with key_lock:
-            # --- Check RPD Limit before making a request ---
             usage_data = key_info.setdefault('usage', {})
             model_usage = usage_data.setdefault(model_name, {
-                'token_count': 0,
-                'request_count': 0,
-                'rpd_limit_reached': False
+                'token_count': 0, 'request_count': 0, 'rpd_limit_reached': False
             })
             
             if model_usage.get('rpd_limit_reached', False):
-                print(f"Ключ #{key_index + 1} уже достиг RPD лимита для модели '{model_name}'. Пропускаем.")
+                app.logger.info(f"Ключ #{key_index + 1} уже достиг RPD лимита для модели '{model_name}'. Пропускаем.")
                 continue
 
         api_key = key_info['key']
         gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
         
         print_status_tui()
-        print(f"\nИспользуется ключ #{key_index + 1} для модели '{model_name}'")
+        app.logger.info(f"Используется ключ #{key_index + 1} для модели '{model_name}'")
 
         for attempt in range(MAX_RETRIES):
             try:
                 response = requests.post(gemini_url, params={'key': api_key}, json=request_data)
 
-                # --- Other 503 Error Handling: Retryable errors ---
                 if response.status_code == 503 and attempt < MAX_RETRIES - 1:
-                    print(f"Получен статус {response.status_code}. Повторная попытка через {RETRY_DELAY_SECONDS} сек...")
+                    app.logger.warning(f"Получен статус 503. Повторная попытка через {RETRY_DELAY_SECONDS} сек...")
                     time.sleep(RETRY_DELAY_SECONDS)
-                    continue # Retry with the same key
+                    continue
 
                 response.raise_for_status()
 
-                # --- Success Case (200 OK) ---
                 response_data = response.json()
                 
-                # Configure genai for token counting
                 genai.configure(api_key=api_key)
                 model = genai.GenerativeModel(model_name)
                 
@@ -310,63 +340,41 @@ def proxy_to_gemini(model_name):
                     api_keys[key_index]['usage'][model_name]['request_count'] += 1
                     save_api_keys()
                 
-                print(f"Запрос успешен. Использовано токенов: {total_tokens}")
+                app.logger.info(f"Запрос успешен. Использовано токенов: {total_tokens}")
                 print_status_tui()
 
                 return response.content, response.status_code, response.headers.items()
 
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 429:
-                    try:
-                        error_json = e.response.json()
-                        error_message_str = error_json.get("error", {}).get("message", "")
-                        
-                        inner_error_json = json.loads(error_message_str)
-                        details = inner_error_json.get("error", {}).get("details", [])
-                        
-                        retry_info = next((d for d in details if d.get("@type") == "type.googleapis.com/google.rpc.RetryInfo"), None)
-
-                        if retry_info and 'retryDelay' in retry_info:
-                            delay_str = retry_info['retryDelay'].replace('s', '')
-                            delay_seconds = float(delay_str)
-                            print(f"Получен статус 429 с retryDelay. Ожидание {delay_seconds} сек...")
-                            time.sleep(delay_seconds)
-                            continue # Повторная попытка с тем же ключом
-                    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as json_e:
-                        print(f"Не удалось распарсить retryDelay из ответа 429: {json_e}")
-                        # RPD limit check as a fallback
-                        if "quotaMetric" in e.response.text:
-                            print(f"Получен статус 429 (RPD Limit) для ключа #{key_index + 1} и модели '{model_name}'.")
-                            with key_lock:
-                                api_keys[key_index]['usage'][model_name]['rpd_limit_reached'] = True
-                                save_api_keys()
-                            last_error_response = e.response
-                            break # Break from retry loop to switch to the next key
+                    delay = handle_rate_limit_error(e.response, key_index, model_name)
+                    if delay is not None:
+                        time.sleep(delay)
+                        continue  # Retry with the same key after delay
+                    else:
+                        last_error_response = e.response
+                        break # RPD limit reached, break to try next key
                 
-                print(f"Ошибка запроса: {e}. Попытка {attempt + 1}/{MAX_RETRIES}")
+                app.logger.error(f"Ошибка запроса: {e}. Попытка {attempt + 1}/{MAX_RETRIES}")
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(RETRY_DELAY_SECONDS)
                 else:
                     last_error_response = e.response
 
             except requests.exceptions.RequestException as e:
-                print(f"Ошибка запроса: {e}. Попытка {attempt + 1}/{MAX_RETRIES}")
+                app.logger.error(f"Ошибка запроса: {e}. Попытка {attempt + 1}/{MAX_RETRIES}")
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(RETRY_DELAY_SECONDS)
                 else:
-                    last_error_response = jsonify({"error": str(e)}), 500
+                    last_error_response = (jsonify({"error": str(e)}), 500)
         
-        # If the retry loop finishes without success, we've already broken out to the next key for RPD limit
-        # or we continue the outer loop to the next key
-        
-    # --- All keys have been tried ---
     if last_error_response:
-        print("Все API ключи были опробованы, возвращается последняя ошибка.")
-        if isinstance(last_error_response, tuple): # Our custom error
+        app.logger.error("Все API ключи были опробованы, возвращается последняя ошибка.")
+        if isinstance(last_error_response, tuple):
              return last_error_response
         return last_error_response.content, last_error_response.status_code, last_error_response.headers.items()
     
-    print("Все API ключи исчерпали свою квоту или недоступны.")
+    app.logger.warning("Все API ключи исчерпали свою квоту или недоступны.")
     return jsonify({"error": "All available API keys have reached their quota or are unable to process the request."}), 429
 
 # --- Main Execution ---
@@ -379,4 +387,4 @@ if __name__ == '__main__':
         print_status_tui()
         app.run(host='0.0.0.0', port=PORT)
     else:
-        print("Сервер не может быть запущен из-за ошибки загрузки ключей.")
+        app.logger.error("Сервер не может быть запущен из-за ошибки загрузки ключей.")
