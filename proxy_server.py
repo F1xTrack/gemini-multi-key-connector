@@ -104,6 +104,49 @@ def print_status_tui():
 
 # --- Flask Endpoint ---
 
+@app.route('/', methods=['GET'])
+def status_page():
+    """
+    Generates and returns an HTML page with the real-time status of API key usage.
+    """
+    html = """
+    <html>
+    <head>
+        <title>Gemini API Proxy Status</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 2em; background-color: #f4f4f9; color: #333; }
+            h1, h2 { color: #444; }
+            .key-block { background-color: #fff; border: 1px solid #ddd; border-radius: 5px; padding: 1em; margin-bottom: 1em; }
+            .model-info { margin-left: 2em; }
+            .rpd-ok { color: green; }
+            .rpd-reached { color: red; }
+        </style>
+    </head>
+    <body>
+        <h1>Gemini API Proxy Status</h1>
+"""
+    with key_lock:
+        html += f"<p><strong>Total Keys Loaded:</strong> {len(api_keys)}</p>"
+        for i, key_info in enumerate(api_keys):
+            html += f'<div class="key-block"><h2>Key #{i+1}</h2>'
+            if not key_info.get('usage'):
+                html += "<p>No usage data yet.</p>"
+            else:
+                for model_name, usage_data in sorted(key_info['usage'].items()):
+                    rpd_status = "Reached" if usage_data.get('rpd_limit_reached', False) else "OK"
+                    rpd_class = "rpd-reached" if usage_data.get('rpd_limit_reached', False) else "rpd-ok"
+                    html += f"""
+                    <div class="model-info">
+                        <p><strong>Model:</strong> {model_name}</p>
+                        <p>Tokens: {usage_data.get('token_count', 0)}</p>
+                        <p>Requests: {usage_data.get('request_count', 0)}</p>
+                        <p>RPD Status: <span class="{rpd_class}">{rpd_status}</span></p>
+                    </div>
+                    """
+            html += '</div>'
+    html += "</body></html>"
+    return html
+
 @app.route('/v1/models', methods=['GET'])
 def list_models():
     model_data = []
