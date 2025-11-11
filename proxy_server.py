@@ -382,8 +382,14 @@ def proxy_to_gemini(model_name):
         headers_dict = {k: v for k, v in last_error_response.headers.items() if k.lower() not in ['transfer-encoding', 'content-encoding']}
         return Response(last_error_response.content, status=last_error_response.status_code, headers=headers_dict)
     
-    app.logger.warning("Все API ключи исчерпали свою квоту или недоступны.")
-    return jsonify({"error": "All available API keys have reached their quota or are unable to process the request."}), 429
+    app.logger.error(f"All API keys have reached their daily limit for model {model_name}.")
+    return jsonify({
+        "error": {
+            "code": 503,
+            "message": f"Service Unavailable: All available API keys have reached their daily usage limit for the requested model ({model_name}). Please try again later.",
+            "status": "SERVICE_UNAVAILABLE"
+        }
+    }), 503
 
 # --- Main Execution ---
 
