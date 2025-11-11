@@ -277,14 +277,14 @@ def proxy_to_gemini(model_name):
                 continue
 
         api_key = key_info['key']
-        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
         
         print_status_tui()
         print(f"\nИспользуется ключ #{key_index + 1} для модели '{model_name}'")
 
         for attempt in range(MAX_RETRIES):
             try:
-                response = requests.post(gemini_url, json=request_data)
+                response = requests.post(gemini_url, params={'key': api_key}, json=request_data)
 
                 # --- Other 503 Error Handling: Retryable errors ---
                 if response.status_code == 503 and attempt < MAX_RETRIES - 1:
