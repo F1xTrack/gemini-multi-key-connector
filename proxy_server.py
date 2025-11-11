@@ -15,9 +15,9 @@ MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 3
 TARGET_TIMEZONE = 'America/Los_Angeles'
 SUPPORTED_MODELS = [
-    "gemini-1.5-pro-latest",
-    "gemini-1.5-flash-latest",
-    "gemini-1.0-pro",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
 ]
 
 # --- Global Variables & Locks ---
@@ -157,16 +157,7 @@ def proxy_to_gemini(model_name):
             try:
                 response = requests.post(gemini_url, json=request_data)
 
-                # --- 429 Error Handling: RPD limit exceeded ---
-                if response.status_code == 429 and "quotaMetric" in response.text:
-                    print(f"Получен статус 429 (RPD Limit) для ключа #{key_index + 1} и модели '{model_name}'.")
-                    with key_lock:
-                        api_keys[key_index]['usage'][model_name]['rpd_limit_reached'] = True
-                        save_api_keys()
-                    last_error_response = response
-                    break # Break from retry loop to switch to the next key
-
-                # --- Other 429/503 Error Handling: Retryable errors ---
+                # --- Other 503 Error Handling: Retryable errors ---
                 if response.status_code == 503 and attempt < MAX_RETRIES - 1:
                     print(f"Получен статус {response.status_code}. Повторная попытка через {RETRY_DELAY_SECONDS} сек...")
                     time.sleep(RETRY_DELAY_SECONDS)
@@ -194,6 +185,40 @@ def proxy_to_gemini(model_name):
                 print_status_tui()
 
                 return response.content, response.status_code, response.headers.items()
+
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429:
+                    try:
+                        error_json = e.response.json()
+                        error_message_str = error_json.get("error", {}).get("message", "")
+                        
+                        inner_error_json = json.loads(error_message_str)
+                        details = inner_error_json.get("error", {}).get("details", [])
+                        
+                        retry_info = next((d for d in details if d.get("@type") == "type.googleapis.com/google.rpc.RetryInfo"), None)
+
+                        if retry_info and 'retryDelay' in retry_info:
+                            delay_str = retry_info['retryDelay'].replace('s', '')
+                            delay_seconds = float(delay_str)
+                            print(f"Получен статус 429 с retryDelay. Ожидание {delay_seconds} сек...")
+                            time.sleep(delay_seconds)
+                            continue # Повторная попытка с тем же ключом
+                    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as json_e:
+                        print(f"Не удалось распарсить retryDelay из ответа 429: {json_e}")
+                        # RPD limit check as a fallback
+                        if "quotaMetric" in e.response.text:
+                            print(f"Получен статус 429 (RPD Limit) для ключа #{key_index + 1} и модели '{model_name}'.")
+                            with key_lock:
+                                api_keys[key_index]['usage'][model_name]['rpd_limit_reached'] = True
+                                save_api_keys()
+                            last_error_response = e.response
+                            break # Break from retry loop to switch to the next key
+                
+                print(f"Ошибка запроса: {e}. Попытка {attempt + 1}/{MAX_RETRIES}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY_SECONDS)
+                else:
+                    last_error_response = e.response
 
             except requests.exceptions.RequestException as e:
                 print(f"Ошибка запроса: {e}. Попытка {attempt + 1}/{MAX_RETRIES}")
